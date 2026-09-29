@@ -121,7 +121,7 @@ button.danger{color:var(--danger)}
             <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.1" />
           </div>
           <div>
-            <label>Max Tokens</label>
+            <label>Max Completion Tokens</label>
             <input id="maxTokens" type="number" min="64" max="8192" value="800" />
           </div>
         </div>
@@ -296,27 +296,56 @@ async function callOpenAICompatible(prompt){
   const model = $('model').value.trim();
   const key = $('apiKey').value.trim();
   if(!url || !model || !key) throw new Error('請填寫 Base URL、Model 與 API Key');
-  const body = {
+
+  const maxTokens = parseInt($('maxTokens').value || '800',10);
+  const baseBody = {
     model,
     messages: [
       {role:'system', content:'Follow the supplied RAG instructions exactly.'},
       {role:'user', content:prompt}
     ],
-    temperature: parseFloat($('temperature').value || '0.1'),
-    max_tokens: parseInt($('maxTokens').value || '800',10)
+    temperature: parseFloat($('temperature').value || '0.1')
   };
-  const res = await fetch(url,{
-    method:'POST',
-    headers:{'Content-Type':'application/json','Authorization':'Bearer ' + key},
-    body:JSON.stringify(body)
-  });
-  const raw = await res.text();
-  let data;
-  try{ data = JSON.parse(raw); }catch{ throw new Error(`API ${res.status}: ${raw.slice(0,500)}`); }
+
+  async function request(tokenField){
+    const body = {...baseBody, [tokenField]: maxTokens};
+    const res = await fetch(url,{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'Authorization':'Bearer ' + key
+      },
+      body:JSON.stringify(body)
+    });
+
+    const raw = await res.text();
+    let data;
+    try{ data = JSON.parse(raw); }
+    catch{ throw new Error(`API ${res.status}: ${raw.slice(0,500)}`); }
+
+    return {res, data};
+  }
+
+  // Newer OpenAI models use max_completion_tokens.
+  // If an OpenAI-compatible provider only supports max_tokens, retry automatically.
+  let {res, data} = await request('max_completion_tokens');
+
+  if(!res.ok){
+    const message = data?.error?.message || `API error ${res.status}`;
+    const unsupportedNewField =
+      /max_completion_tokens/i.test(message) &&
+      /(unsupported|unknown|unrecognized|not supported|invalid)/i.test(message);
+
+    if(unsupportedNewField){
+      ({res, data} = await request('max_tokens'));
+    }
+  }
+
   if(!res.ok) throw new Error(data?.error?.message || `API error ${res.status}`);
-  const content = data?.choices?.[0]?.message?.content;
-  if(!content) throw new Error('API response 沒有 choices[0].message.content');
-  return content;
+
+  const answer = data?.choices?.[0]?.message?.content;
+  if(!answer) throw new Error('API response 沒有 choices[0].message.content');
+  return answer;
 }
 
 function updateDebug(question, retrieved, prompt){
