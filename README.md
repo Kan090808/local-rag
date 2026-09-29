@@ -14,7 +14,10 @@
 - 不做 Embedding
 - 不需要 Vector Database
 - 使用整份文件做 BM25 Retrieval
-- 支援 All Context 模式
+- Query Rewrite（使用 API Key；未設定或失敗時沿用原始 Query）
+- 可在網頁維護同義詞組，保存於瀏覽器 `localStorage`
+- 無文件達最低 BM25 分數時，自動 fallback 到 All Context
+- 支援手動 All Context 模式
 - 支援 Debug Retrieval
 - 支援 OpenAI-compatible API
 
@@ -24,6 +27,14 @@
 
 部分 LLM Provider 可能因 CORS 政策不允許瀏覽器直接呼叫，
 此時需要換成允許 browser request 的 provider，或未來加入自己的 backend proxy。
+
+## UI Smoke Test
+
+```sh
+python3 -m http.server 8000
+```
+
+開啟 `http://localhost:8000/tests/ui-smoke.html`。
 
 ## GitHub Pages 部署
 
@@ -43,7 +54,9 @@
 
 - API Base URL
 - Model
-- API Key
+- API Key（只在 OpenAI-compatible API 模式需要）
+
+Query Rewrite 會使用目前設定的 API 呼叫一次 LLM；沒有 Key 或改寫失敗時改用原始問題。Synonym Expansion、BM25 與低分數 fallback 都在瀏覽器本機執行，不需要 API Key。使用 API 模式產生最終回答仍需要 API Key。
 
 預設 API Key 不會持久保存。
 
@@ -56,9 +69,13 @@ Local TXT / Markdown
         ↓
 Browser
         ↓
-BM25 whole-document retrieval
+Optional LLM Query Rewrite (API Key required)
         ↓
-Top K documents
+Local synonym expansion (no API Key)
+        ↓
+BM25 whole-document retrieval (no API Key)
+        ↓
+Top K documents, or All Context if no document reaches Min Score (no API Key)
         ↓
 Prompt Builder
         ↓

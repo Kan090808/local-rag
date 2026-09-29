@@ -39,6 +39,9 @@ button.danger{color:var(--danger)}
 .file-meta{font-size:11px;color:var(--muted);margin-top:4px}
 .file-actions{display:flex;gap:6px;margin-top:7px}
 .file-actions button{padding:5px 8px;font-size:11px}
+.synonym-list{display:flex;flex-direction:column;gap:7px;margin-top:8px}
+.synonym-row{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center}
+.synonym-row button{padding:5px 8px}
 .header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
 .status{font-size:12px;color:var(--muted)}
 .chat{flex:1;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
@@ -73,6 +76,13 @@ button.danger{color:var(--danger)}
         <button id="loadDemo">載入 Demo</button>
         <button id="clearFiles" class="danger">清除</button>
       </div>
+    </div>
+
+    <div class="section">
+      <h2>Synonym Expansion</h2>
+      <div class="small">每列是一組互相等價的詞，以逗號分隔；變更保存在此瀏覽器。</div>
+      <div id="synonymGroups" class="synonym-list"></div>
+      <button id="addSynonymGroup" type="button" style="margin-top:8px">新增詞組</button>
     </div>
 
     <div class="section">
@@ -159,11 +169,24 @@ button.danger{color:var(--danger)}
 <script>
 const state = {
   docs: [],
-  history: []
+  history: [],
+  synonymGroups: loadSynonymGroups()
 };
 
 const $ = id => document.getElementById(id);
 const escapeHtml = s => s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+function loadSynonymGroups(){
+  try{
+    const groups = JSON.parse(localStorage.getItem('localRagSynonymGroups') || '[]');
+    return Array.isArray(groups) ? groups.filter(Array.isArray).map(group => group.filter(term => typeof term === 'string')) : [];
+  }catch{return [];}
+}
+
+function saveSynonymGroups(){
+  try{ localStorage.setItem('localRagSynonymGroups', JSON.stringify(state.synonymGroups)); }
+  catch{ $('status').textContent = '無法保存同義詞設定'; }
+}
 
 function formatBytes(n){
   if(n < 1024) return n + ' B';
@@ -179,6 +202,19 @@ function tokenize(text){
   const cjkBi = [];
   for(let i=0;i<cjkChars.length-1;i++) cjkBi.push(cjkChars[i] + cjkChars[i+1]);
   return [...ascii, ...cjkUni, ...cjkBi];
+}
+
+function expandQuery(query, groups){
+  const terms = new Set(tokenize(query));
+  const additions = new Set();
+  for(const group of groups){
+    // ponytail: token-set matching may match multiword terms out of order; use phrase-aware matching if this causes false expansions.
+    const members = group.map(term => ({term, tokens:tokenize(term)})).filter(x => x.tokens.length);
+    if(members.some(x => x.tokens.every(token => terms.has(token)))){
+      for(const member of members) if(!member.tokens.every(token => terms.has(token))) additions.add(member.term);
+    }
+  }
+  return {query:[query, ...additions].join(' '), additions:[...additions]};
 }
 
 function bm25(query, docs, k1=1.5, b=0.75){
@@ -214,10 +250,13 @@ function bm25(query, docs, k1=1.5, b=0.75){
 
 function retrieve(question){
   const mode = $('retrievalMode').value;
-  if(mode === 'all') return state.docs.map(d => ({doc:d, score:null}));
+  if(mode === 'all') return {documents:state.docs.map(doc => ({doc, score:null})), fallback:false};
   const topK = Math.max(1, parseInt($('topK').value || '3',10));
   const minScore = Math.max(0, parseFloat($('minScore').value || '0'));
-  return bm25(question, state.docs).filter(x => x.score >= minScore).slice(0, topK);
+  const matches = bm25(question, state.docs).filter(x => x.score >= minScore).slice(0, topK);
+  return matches.length ? {documents:matches, fallback:false} : {
+    documents:state.docs.map(doc => ({doc, score:null})), fallback:state.docs.length > 0
+  };
 }
 
 function buildPrompt(question, retrieved){
@@ -248,6 +287,34 @@ ${recent}
 <question>
 ${question}
 </question>`;
+}
+
+function renderSynonymGroups(){
+  const list = $('synonymGroups');
+  list.replaceChildren();
+  state.synonymGroups.forEach((group, index) => {
+    const row = document.createElement('div');
+    row.className = 'synonym-row';
+    const input = document.createElement('input');
+    input.value = group.join(', ');
+    input.setAttribute('aria-label', `同義詞組 ${index+1}`);
+    input.placeholder = '例如：保固, 保修';
+    input.oninput = () => {
+      state.synonymGroups[index] = input.value.split(',').map(term => term.trim()).filter(Boolean);
+      saveSynonymGroups();
+    };
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'danger';
+    remove.textContent = '刪除';
+    remove.onclick = () => {
+      state.synonymGroups.splice(index, 1);
+      saveSynonymGroups();
+      renderSynonymGroups();
+    };
+    row.append(input, remove);
+    list.appendChild(row);
+  });
 }
 
 function renderFiles(){
@@ -291,7 +358,7 @@ function addMessage(role, content, sources=[]){
   $('chat').scrollTop = $('chat').scrollHeight;
 }
 
-async function callOpenAICompatible(prompt){
+async function callOpenAICompatible(prompt, system='Follow the supplied RAG instructions exactly.'){
   const url = $('baseUrl').value.trim();
   const model = $('model').value.trim();
   const key = $('apiKey').value.trim();
@@ -301,10 +368,10 @@ async function callOpenAICompatible(prompt){
   const baseBody = {
     model,
     messages: [
-      {role:'system', content:'Follow the supplied RAG instructions exactly.'},
+      {role:'system', content:system},
       {role:'user', content:prompt}
     ],
-    temperature: parseFloat($('temperature').value || '0.1')
+    temperature: parseFloat($('temperature').value || '1')
   };
 
   async function request(tokenField){
@@ -348,11 +415,19 @@ async function callOpenAICompatible(prompt){
   return answer;
 }
 
-function updateDebug(question, retrieved, prompt){
+async function rewriteQuery(question){
+  return callOpenAICompatible(
+    `Rewrite this question as a concise search query for retrieving customer-service documents. Preserve its meaning, entities, and language. Do not answer. Return only the rewritten query.\n\nQuestion: ${question}`,
+    'You rewrite search queries. Return only one concise query, with no explanation or quotation marks.'
+  );
+}
+
+function updateDebug(question, rewritten, expanded, retrieved, fallback, prompt){
   if(!$('debugToggle').checked){ $('debugBox').classList.add('hidden'); return; }
   $('debugBox').classList.remove('hidden');
   const lines = [
-    `Query: ${question}`,'','Retrieved documents:',
+    `Query: ${question}`,`Rewritten Query: ${rewritten}`,`Synonym Expansion: ${expanded.length ? expanded.join(', ') : '(none)'}`,
+    `All Context fallback: ${fallback ? 'yes' : 'no'}`,'','Retrieved documents:',
     ...retrieved.map((x,i)=>`${i+1}. ${x.doc.name} | score=${x.score===null?'ALL':x.score.toFixed(4)} | size=${formatBytes(x.doc.size)}`),
     '',`Prompt length: ${prompt.length.toLocaleString()} chars`,`Documents in context: ${retrieved.length}`
   ];
@@ -368,14 +443,21 @@ async function ask(){
   $('askBtn').disabled = true;
   $('status').textContent = 'Retrieving...';
   try{
-    const retrieved = retrieve(q);
+    let rewritten = q;
+    if($('llmMode').value === 'api' && $('apiKey').value.trim()){
+      try{ rewritten = (await rewriteQuery(q)).trim() || q; }
+      catch{ rewritten = q; }
+    }
+    const expanded = expandQuery(`${q} ${rewritten}`, state.synonymGroups);
+    const result = retrieve(expanded.query);
+    const retrieved = result.documents;
     if(!retrieved.length){
-      addMessage('assistant', '目前本地文件中找不到足夠相關的內容。');
-      $('status').textContent='No relevant document';
+      addMessage('assistant', '目前沒有可供搜尋的本地文件。');
+      $('status').textContent='No documents';
       return;
     }
     const prompt = buildPrompt(q, retrieved);
-    updateDebug(q, retrieved, prompt);
+    updateDebug(q, rewritten, expanded.additions, retrieved, result.fallback, prompt);
     if($('llmMode').value === 'mock'){
       const preview = retrieved.map((x,i) =>
         `${i+1}. ${x.doc.name}${x.score===null?'':` (score ${x.score.toFixed(3)})`}\n${x.doc.content.slice(0,260)}${x.doc.content.length>260?'…':''}`
@@ -389,7 +471,10 @@ async function ask(){
       $('status').textContent='Done';
     }
   }catch(err){
-    addMessage('assistant', '錯誤：' + (err?.message || String(err)));
+    const message = err?.message || String(err);
+    addMessage('assistant', /context_length_exceeded|maximum context length|too many tokens|context window/i.test(message)
+      ? '全部文件超過模型上下文限制；請減少文件或改用 BM25 Top K。'
+      : '錯誤：' + message);
     $('status').textContent='Error';
   }finally{ $('askBtn').disabled = false; }
 }
@@ -433,6 +518,12 @@ $('loadDemo').onclick = () => {
 };
 
 $('clearFiles').onclick = () => { state.docs=[]; renderFiles(); };
+$('addSynonymGroup').onclick = () => {
+  state.synonymGroups.push([]);
+  saveSynonymGroups();
+  renderSynonymGroups();
+  $('synonymGroups').lastElementChild?.querySelector('input').focus();
+};
 $('askBtn').onclick = ask;
 $('question').addEventListener('keydown', e => { if((e.ctrlKey || e.metaKey) && e.key === 'Enter') ask(); });
 $('llmMode').onchange = () => { $('apiFields').classList.toggle('hidden', $('llmMode').value !== 'api'); };
@@ -447,6 +538,7 @@ $('apiKey').addEventListener('input', () => {
 const saved = sessionStorage.getItem('localRagApiKey');
 if(saved){ $('apiKey').value=saved; $('saveSession').checked=true; }
 renderFiles();
+renderSynonymGroups();
 </script>
 </body>
 </html>
